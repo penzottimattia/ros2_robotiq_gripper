@@ -35,8 +35,8 @@ controller_interface::InterfaceConfiguration RobotiqActivationController::comman
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
-  config.names.emplace_back("reactivate_gripper/reactivate_gripper_cmd");
-  config.names.emplace_back("reactivate_gripper/reactivate_gripper_response");
+  config.names.emplace_back(prefix_ + "reactivate_gripper/reactivate_gripper_cmd");
+  config.names.emplace_back(prefix_ + "reactivate_gripper/reactivate_gripper_response");
 
   return config;
 }
@@ -99,27 +99,54 @@ RobotiqActivationController::on_deactivate(const rclcpp_lifecycle::State& /*prev
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn RobotiqActivationController::on_init()
 {
+  try
+  {
+    auto_declare<std::string>("prefix", "");
+    prefix_ = get_node()->get_parameter("prefix").as_string();
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_ERROR(get_node()->get_logger(), "Exception during on_init: %s", e.what());
+    return LifecycleNodeInterface::CallbackReturn::ERROR;
+  }
   return LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
 
 bool RobotiqActivationController::reactivateGripper(std_srvs::srv::Trigger::Request::SharedPtr /*req*/,
                                                     std_srvs::srv::Trigger::Response::SharedPtr resp)
 {
-  resp->success = command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].set_value(ASYNC_WAITING);
-  resp->success &= command_interfaces_[REACTIVATE_GRIPPER_CMD].set_value(1.0);
+  // Humble's LoanedCommandInterface::set_value returns void and there is no get_optional().
+  // Set values and manage success manually.
+  resp->success = true;
 
-  while (true)
+  // Mark the response interface as waiting and send the reactivation command.
+  try {
+    command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].set_value(ASYNC_WAITING);
+    command_interfaces_[REACTIVATE_GRIPPER_CMD].set_value(1.0);
+  } catch (const std::exception &e) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Exception writing to command interfaces: %s", e.what());
+    resp->success = false;
+    return resp->success;
+  } catch (...) {
+    RCLCPP_ERROR(get_node()->get_logger(), "Unknown exception writing to command interfaces");
+    resp->success = false;
+    return resp->success;
+  }
+
+  // Wait until the response interface is updated from ASYNC_WAITING.
+  while (rclcpp::ok())
   {
-    const auto maybe_value = command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].get_optional();
-    if (maybe_value && maybe_value.value() != ASYNC_WAITING)
+    const double value = command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].get_value();
+    if (value != ASYNC_WAITING)
     {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-  // NOTE: This was previously using get_value() and implicitly casting to bool, so keeping the old behavior.
-  // However, note that the value of this result is actually a double, so this should be revised in the future.
-  resp->success &= static_cast<bool>(command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].get_optional().value_or(false));
+
+  // The stored response is a numeric value (double). Convert to bool for the service response.
+  const double final_value = command_interfaces_[REACTIVATE_GRIPPER_RESPONSE].get_value();
+  resp->success &= static_cast<bool>(final_value);
 
   return resp->success;
 }

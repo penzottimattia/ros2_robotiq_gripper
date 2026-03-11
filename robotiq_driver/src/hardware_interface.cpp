@@ -55,6 +55,17 @@ namespace robotiq_driver
 RobotiqGripperHardwareInterface::RobotiqGripperHardwareInterface()
 {
   driver_factory_ = std::make_unique<DefaultDriverFactory>();
+
+  // Initialize communication flags
+  communication_thread_is_running_.store(false);
+  reactivate_gripper_async_cmd_.store(false);
+  reactivate_gripper_async_response_.store(std::nullopt);
+
+  // Initialize async activation/deactivation flags
+  activate_async_cmd_.store(false);
+  activate_async_response_.store(std::nullopt);
+  deactivate_async_cmd_.store(false);
+  deactivate_async_response_.store(std::nullopt);
 }
 
 RobotiqGripperHardwareInterface::~RobotiqGripperHardwareInterface()
@@ -73,11 +84,12 @@ RobotiqGripperHardwareInterface::RobotiqGripperHardwareInterface(std::unique_ptr
 }
 
 hardware_interface::CallbackReturn
-RobotiqGripperHardwareInterface::on_init(const hardware_interface::HardwareComponentInterfaceParams& params)
+RobotiqGripperHardwareInterface::on_init(const hardware_interface::HardwareInfo& info)
 {
   RCLCPP_DEBUG(kLogger, "on_init");
 
-  if (hardware_interface::SystemInterface::on_init(params) != CallbackReturn::SUCCESS)
+  // Call base class on_init which expects a HardwareInfo
+  if (hardware_interface::SystemInterface::on_init(info) != CallbackReturn::SUCCESS)
   {
     return CallbackReturn::ERROR;
   }
@@ -209,9 +221,9 @@ std::vector<hardware_interface::CommandInterface> RobotiqGripperHardwareInterfac
                                            1.0);
 
   command_interfaces.emplace_back(
-      hardware_interface::CommandInterface("reactivate_gripper", "reactivate_gripper_cmd", &reactivate_gripper_cmd_));
+      hardware_interface::CommandInterface(info_.gpios[0].name, "reactivate_gripper_cmd", &reactivate_gripper_cmd_));
   command_interfaces.emplace_back(hardware_interface::CommandInterface(
-      "reactivate_gripper", "reactivate_gripper_response", &reactivate_gripper_response_));
+      info_.gpios[0].name, "reactivate_gripper_response", &reactivate_gripper_response_));
 
   return command_interfaces;
 }
@@ -229,14 +241,16 @@ RobotiqGripperHardwareInterface::on_activate(const rclcpp_lifecycle::State& /*pr
     gripper_position_command_ = 0;
   }
 
-  // Activate the gripper.
+  // Activate the gripper asynchronously to avoid blocking the lifecycle thread.
   try
   {
-    driver_->deactivate();
-    driver_->activate();
-
+    // Start communication thread first so it can process the async activation request.
     communication_thread_is_running_.store(true);
     communication_thread_ = std::thread([this] { this->background_task(); });
+
+    // Request activation in the background thread.
+    activate_async_response_.store(std::nullopt);
+    activate_async_cmd_.store(true);
   }
   catch (const std::exception& e)
   {
@@ -244,7 +258,7 @@ RobotiqGripperHardwareInterface::on_activate(const rclcpp_lifecycle::State& /*pr
     return CallbackReturn::ERROR;
   }
 
-  RCLCPP_INFO(kLogger, "Robotiq Gripper successfully activated!");
+  RCLCPP_INFO(kLogger, "Robotiq Gripper activation requested (background).");
   return CallbackReturn::SUCCESS;
 }
 
@@ -253,8 +267,27 @@ RobotiqGripperHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& /*
 {
   RCLCPP_DEBUG(kLogger, "on_deactivate");
 
+  // Request deactivation to be performed in the background thread so we don't
+  // block the lifecycle thread calling driver_->deactivate() directly.
+  deactivate_async_response_.store(std::nullopt);
+  deactivate_async_cmd_.store(true);
+
+  // Wait for the background thread to complete the deactivation up to a timeout.
+  const auto timeout = std::chrono::seconds{5};
+  const auto start = std::chrono::steady_clock::now();
+  while (!deactivate_async_response_.load().has_value())
+  {
+    if (std::chrono::steady_clock::now() - start > timeout)
+    {
+      RCLCPP_WARN(kLogger, "Timeout waiting for background deactivation; proceeding to stop communication thread.");
+      break;
+    }
+    // Sleep a bit to avoid busy waiting.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // Stop the communication thread and join it.
   communication_thread_is_running_.store(false);
-  communication_thread_.join();
   if (communication_thread_.joinable())
   {
     communication_thread_.join();
@@ -262,13 +295,32 @@ RobotiqGripperHardwareInterface::on_deactivate(const rclcpp_lifecycle::State& /*
 
   try
   {
-    driver_->deactivate();
+    if (deactivate_async_response_.load().has_value() && deactivate_async_response_.load().value())
+    {
+      RCLCPP_INFO(kLogger, "Robotiq Gripper successfully deactivated (background).");
+      return CallbackReturn::SUCCESS;
+    }
+    else
+    {
+      // If background deactivation failed or timed out, try a final cleanup call
+      // to ensure driver is deactivated. Do it in a try/catch to avoid throwing.
+      try
+      {
+        driver_->deactivate();
+      }
+      catch (const std::exception& e)
+      {
+        RCLCPP_ERROR(kLogger, "Failed to deactivate the Robotiq gripper: %s", e.what());
+        return CallbackReturn::ERROR;
+      }
+    }
   }
   catch (const std::exception& e)
   {
-    RCLCPP_ERROR(kLogger, "Failed to deactivate the Robotiq gripper: %s", e.what());
+    RCLCPP_ERROR(kLogger, "Failed during deactivation cleanup: %s", e.what());
     return CallbackReturn::ERROR;
   }
+
   RCLCPP_INFO(kLogger, "Robotiq Gripper successfully deactivated!");
   return CallbackReturn::SUCCESS;
 }
@@ -314,6 +366,41 @@ void RobotiqGripperHardwareInterface::background_task()
   {
     try
     {
+      // Process async activation request
+      if (activate_async_cmd_.load())
+      {
+        try
+        {
+          this->driver_->deactivate();
+          this->driver_->activate();
+          activate_async_response_.store(std::optional<bool>(true));
+          RCLCPP_INFO(kLogger, "Robotiq Gripper activated (background).");
+        }
+        catch (const std::exception& e)
+        {
+          activate_async_response_.store(std::optional<bool>(false));
+          RCLCPP_ERROR(kLogger, "Background activation failed: %s", e.what());
+        }
+        activate_async_cmd_.store(false);
+      }
+
+      // Process async deactivation request
+      if (deactivate_async_cmd_.load())
+      {
+        try
+        {
+          this->driver_->deactivate();
+          deactivate_async_response_.store(std::optional<bool>(true));
+          RCLCPP_INFO(kLogger, "Robotiq Gripper deactivated (background).");
+        }
+        catch (const std::exception& e)
+        {
+          deactivate_async_response_.store(std::optional<bool>(false));
+          RCLCPP_ERROR(kLogger, "Background deactivation failed: %s", e.what());
+        }
+        deactivate_async_cmd_.store(false);
+      }
+
       // Re-activate the gripper
       // (this can be used, for example, to re-run the auto-calibration).
       if (reactivate_gripper_async_cmd_.load())

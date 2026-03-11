@@ -59,6 +59,7 @@ private:
     REACTIVATE_GRIPPER_RESPONSE
   };
 
+  std::string prefix_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reactivate_gripper_srv_;
 };
 }  // namespace robotiq_controllers
