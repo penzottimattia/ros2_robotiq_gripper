@@ -145,6 +145,8 @@ int main(int argc, char* argv[])
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
+    std::cout << "Reading gripper position: " << static_cast<int>(driver->get_gripper_position()) << std::endl;
+
     std::cout << "Decreasing gripper speed..." << std::endl;
     driver->set_speed(0x0F);
 
@@ -154,6 +156,8 @@ int main(int argc, char* argv[])
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+
+    std::cout << "Reading gripper position: " << static_cast<int>(driver->get_gripper_position()) << std::endl;
 
     std::cout << "Increasing gripper speed..." << std::endl;
     driver->set_speed(0xFF);
