@@ -371,6 +371,7 @@ void RobotiqGripperHardwareInterface::background_task()
       {
         try
         {
+          this->driver_->deactivate();
           this->driver_->connect();
           this->driver_->set_speed(write_speed_.load());
           this->driver_->set_force(write_force_.load());
